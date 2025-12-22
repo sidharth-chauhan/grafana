@@ -2,8 +2,7 @@
   "kind": "Dashboard",
   "apiVersion": "dashboard.grafana.app/v2beta1",
   "metadata": {
-    "name": "test-v2alpha1-annotations",
-    "creationTimestamp": null
+    "name": "test-v2alpha1-annotations"
   },
   "spec": {
     "annotations": [
@@ -977,8 +976,8 @@
         "spec": {
           "name": "variable-ds-prometheus",
           "current": {
-            "text": null,
-            "value": null
+            "text": "",
+            "value": ""
           },
           "hide": "dontHide",
           "refresh": "",
@@ -1007,8 +1006,8 @@
         "spec": {
           "name": "variable-no-ds",
           "current": {
-            "text": null,
-            "value": null
+            "text": "",
+            "value": ""
           },
           "hide": "dontHide",
           "refresh": "",
@@ -1035,8 +1034,8 @@
         "spec": {
           "name": "variable-no-ds-empty-query",
           "current": {
-            "text": null,
-            "value": null
+            "text": "",
+            "value": ""
           },
           "hide": "dontHide",
           "refresh": "",
@@ -1060,8 +1059,8 @@
         "spec": {
           "name": "variable-no-default-ds",
           "current": {
-            "text": null,
-            "value": null
+            "text": "",
+            "value": ""
           },
           "hide": "dontHide",
           "refresh": "",

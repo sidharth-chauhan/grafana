@@ -5,8 +5,18 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/grafana/grafana-app-sdk/logging"
 	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
 	"github.com/grafana/grafana/apps/provisioning/pkg/repository"
+	"github.com/grafana/grafana/pkg/registry/apis/provisioning/utils"
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+const (
+	// recentHealthyDuration defines how recent a health check must be to be considered "recent" when healthy
+	recentHealthyDuration = 5 * time.Minute
+	// recentHealthyDuration defines how recent a health check must be to be considered "recent" when unhealthy
+	recentUnhealthyDuration = 1 * time.Minute
 )
 
 // StatusPatcher defines the interface for updating repository status
@@ -16,15 +26,32 @@ type StatusPatcher interface {
 	Patch(ctx context.Context, repo *provisioning.Repository, patchOperations ...map[string]interface{}) error
 }
 
+// HealthCheckerInterface defines the interface for health checking operations
+//
+//go:generate mockery --name=HealthCheckerInterface --structname=MockHealthChecker
+type HealthCheckerInterface interface {
+	ShouldCheckHealth(repo *provisioning.Repository) bool
+	RefreshHealth(ctx context.Context, repo repository.Repository) (*provisioning.TestResults, provisioning.HealthStatus, error)
+	RefreshHealthWithPatchOps(ctx context.Context, repo repository.Repository) (*provisioning.TestResults, provisioning.HealthStatus, []map[string]interface{}, error)
+	RefreshTimestamp(ctx context.Context, repo *provisioning.Repository) error
+	RecordFailure(ctx context.Context, failureType provisioning.HealthFailureType, err error, repo *provisioning.Repository) error
+	HasRecentFailure(healthStatus provisioning.HealthStatus, failureType provisioning.HealthFailureType) bool
+}
+
 // HealthChecker provides unified health checking for repositories
 type HealthChecker struct {
 	statusPatcher StatusPatcher
+	healthMetrics healthMetrics
+	tester        repository.SimpleRepositoryTester
 }
 
 // NewHealthChecker creates a new health checker
-func NewHealthChecker(statusPatcher StatusPatcher) *HealthChecker {
+func NewHealthChecker(statusPatcher StatusPatcher, registry prometheus.Registerer, tester repository.SimpleRepositoryTester) *HealthChecker {
+	healthMetrics := registerHealthMetrics(registry)
 	return &HealthChecker{
 		statusPatcher: statusPatcher,
+		healthMetrics: healthMetrics,
+		tester:        tester,
 	}
 }
 
@@ -52,9 +79,9 @@ func (hc *HealthChecker) hasRecentHealthCheck(healthStatus provisioning.HealthSt
 
 	age := time.Since(time.UnixMilli(healthStatus.Checked))
 	if healthStatus.Healthy {
-		return age <= time.Minute*5 // Recent if checked within 5 minutes when healthy
+		return age <= recentHealthyDuration
 	}
-	return age <= time.Minute // Recent if checked within 1 minute when unhealthy
+	return age <= recentUnhealthyDuration // Recent if checked within 1 minute when unhealthy
 }
 
 // HasRecentFailure checks if there's a recent failure of a specific type
@@ -64,7 +91,7 @@ func (hc *HealthChecker) HasRecentFailure(healthStatus provisioning.HealthStatus
 	}
 
 	age := time.Since(time.UnixMilli(healthStatus.Checked))
-	return age <= time.Minute // Recent if within 1 minute
+	return age <= recentUnhealthyDuration
 }
 
 // RecordFailureAndUpdate records a failure and updates the repository status
@@ -103,7 +130,11 @@ func (hc *HealthChecker) hasHealthStatusChanged(old, new provisioning.HealthStat
 		return true
 	}
 
-	if old.Checked != new.Checked {
+	recent := recentUnhealthyDuration
+	if new.Healthy {
+		recent = recentHealthyDuration
+	}
+	if time.UnixMilli(new.Checked).Sub(time.UnixMilli(old.Checked)) > recent {
 		return true
 	}
 
@@ -143,6 +174,33 @@ func (hc *HealthChecker) RefreshHealth(ctx context.Context, repo repository.Repo
 	return testResults, newHealthStatus, nil
 }
 
+// RefreshHealthWithPatchOps performs a health check on an existing repository
+// and returns the test results, health status, and patch operations to apply.
+// This method does NOT apply the patch itself, allowing the caller to batch
+// multiple status updates together to avoid race conditions.
+func (hc *HealthChecker) RefreshHealthWithPatchOps(ctx context.Context, repo repository.Repository) (*provisioning.TestResults, provisioning.HealthStatus, []map[string]interface{}, error) {
+	cfg := repo.Config()
+
+	// Use health checker to perform comprehensive health check with existing status
+	testResults, newHealthStatus, err := hc.refreshHealth(ctx, repo, cfg.Status.Health)
+	if err != nil {
+		return nil, provisioning.HealthStatus{}, nil, fmt.Errorf("health check failed: %w", err)
+	}
+
+	var patchOps []map[string]interface{}
+
+	// Only return patch operation if health status actually changed
+	if hc.hasHealthStatusChanged(cfg.Status.Health, newHealthStatus) {
+		patchOps = append(patchOps, map[string]interface{}{
+			"op":    "replace",
+			"path":  "/status/health",
+			"value": newHealthStatus,
+		})
+	}
+
+	return testResults, newHealthStatus, patchOps, nil
+}
+
 // RefreshTimestamp updates the health status timestamp without changing other fields
 func (hc *HealthChecker) RefreshTimestamp(ctx context.Context, repo *provisioning.Repository) error {
 	// Update the timestamp on the existing health status
@@ -163,8 +221,17 @@ func (hc *HealthChecker) RefreshTimestamp(ctx context.Context, repo *provisionin
 // refreshHealth performs a comprehensive health check
 // Returns test results, health status, and any error
 func (hc *HealthChecker) refreshHealth(ctx context.Context, repo repository.Repository, existingStatus provisioning.HealthStatus) (*provisioning.TestResults, provisioning.HealthStatus, error) {
-	res, err := repository.TestRepository(ctx, repo)
+	logger := logging.FromContext(ctx).With("repo", repo.Config().GetName(), "namespace", repo.Config().GetNamespace())
+	start := time.Now()
+	outcome := utils.SuccessOutcome
+	defer func() {
+		hc.healthMetrics.RecordHealthCheck(outcome, time.Since(start).Seconds())
+	}()
+
+	res, err := hc.tester.TestRepository(ctx, repo)
 	if err != nil {
+		outcome = utils.ErrorOutcome
+		logger.Error("failed to test repository", "error", err)
 		return nil, existingStatus, fmt.Errorf("failed to test repository: %w", err)
 	}
 

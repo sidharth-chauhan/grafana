@@ -9,6 +9,7 @@ export type RepoType = RepositorySpec['type'];
 export interface MigrateFormData {
   history: boolean;
   identifier: boolean;
+  migrateResources?: boolean;
 }
 
 export interface WizardFormData {
@@ -24,9 +25,9 @@ export interface ModeOption {
   label: string;
   description: string;
   subtitle: string;
+  disabled: boolean;
+  disabledReason?: string;
 }
-
-export type StepStatus = 'idle' | 'running' | 'error' | 'success';
 
 export const RepoTypeDisplay: { [key in RepoType]: string } = {
   github: 'GitHub',

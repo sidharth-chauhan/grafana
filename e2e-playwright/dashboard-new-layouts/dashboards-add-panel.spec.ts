@@ -4,6 +4,7 @@ test.use({
   featureToggles: {
     kubernetesDashboards: true,
     dashboardNewLayouts: true,
+    dashboardUndoRedo: true,
     groupByVariable: true,
   },
 });
@@ -20,6 +21,9 @@ test.describe(
     test('can add a new panel', async ({ gotoDashboardPage, selectors, page }) => {
       const dashboardPage = await gotoDashboardPage({ uid: PAGE_UNDER_TEST });
       await expect(page.getByText(DASHBOARD_NAME)).toBeVisible();
+
+      const undockButton = page.getByRole('button', { name: 'Undock menu' });
+      await undockButton.click();
 
       await dashboardPage.getByGrafanaSelector(selectors.components.NavToolbar.editDashboard.editButton).click();
 

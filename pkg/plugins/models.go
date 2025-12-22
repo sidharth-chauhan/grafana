@@ -238,6 +238,7 @@ type ReleaseState string
 
 const (
 	ReleaseStateAlpha ReleaseState = "alpha"
+	ReleaseStateBeta  ReleaseState = "beta"
 )
 
 type SignatureType string
@@ -318,6 +319,7 @@ type PanelDTO struct {
 	HideFromList    bool              `json:"hideFromList"`
 	Sort            int               `json:"sort"`
 	SkipDataQuery   bool              `json:"skipDataQuery"`
+	Suggestions     bool              `json:"suggestions,omitempty"`
 	ReleaseState    string            `json:"state"`
 	BaseURL         string            `json:"baseUrl"`
 	Signature       string            `json:"signature"`
@@ -339,6 +341,7 @@ type AppDTO struct {
 	Dependencies    Dependencies      `json:"dependencies"`
 	ModuleHash      string            `json:"moduleHash,omitempty"`
 	Translations    map[string]string `json:"translations,omitempty"`
+	BuildMode       string            `json:"buildMode,omitempty"`
 }
 
 const (
@@ -456,3 +459,20 @@ type QueryCachingConfig struct {
 	Enabled bool  `json:"enabled"`
 	TTLMS   int64 `json:"TTLMs"`
 }
+
+// CloudProvisioningMethod is the method used to provision the plugin in Grafana Cloud.
+type CloudProvisioningMethod string
+
+const (
+	// CloudProvisioningMethodUnknown is used when the plugin provisioning method is unknown.
+	CloudProvisioningMethodUnknown CloudProvisioningMethod = "unknown"
+
+	// CloudProvisioningMethodNone is used when the plugin is not provisioned in Grafana Cloud.
+	CloudProvisioningMethodNone CloudProvisioningMethod = "none"
+
+	// CloudProvisioningMethodURL is used when the plugin is provisioned from a URL.
+	CloudProvisioningMethodURL CloudProvisioningMethod = "url"
+
+	// CloudProvisioningMethodCatalog is used when the plugin is provisioned from the catalog.
+	CloudProvisioningMethodCatalog CloudProvisioningMethod = "catalog"
+)

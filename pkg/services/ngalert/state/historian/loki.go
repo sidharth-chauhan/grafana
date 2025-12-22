@@ -12,16 +12,17 @@ import (
 	"time"
 
 	"github.com/benbjohnson/clock"
+	"github.com/grafana/alerting/notify/historian/lokiclient"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
-	"github.com/grafana/grafana/pkg/services/ngalert/lokiclient"
 	"go.opentelemetry.io/otel/trace"
+
+	alertingInstrument "github.com/grafana/alerting/http/instrument"
 
 	"github.com/grafana/grafana/pkg/apimachinery/errutil"
 	"github.com/grafana/grafana/pkg/components/simplejson"
 	"github.com/grafana/grafana/pkg/infra/log"
 	"github.com/grafana/grafana/pkg/infra/tracing"
 	"github.com/grafana/grafana/pkg/services/ngalert/accesscontrol"
-	"github.com/grafana/grafana/pkg/services/ngalert/client"
 	"github.com/grafana/grafana/pkg/services/ngalert/eval"
 	"github.com/grafana/grafana/pkg/services/ngalert/metrics"
 	"github.com/grafana/grafana/pkg/services/ngalert/models"
@@ -85,7 +86,7 @@ type RemoteLokiBackend struct {
 	ruleStore      RuleStore
 }
 
-func NewRemoteLokiBackend(logger log.Logger, cfg lokiclient.LokiConfig, req client.Requester, metrics *metrics.Historian, tracer tracing.Tracer, ruleStore RuleStore, ac AccessControl) *RemoteLokiBackend {
+func NewRemoteLokiBackend(logger log.Logger, cfg lokiclient.LokiConfig, req alertingInstrument.Requester, metrics *metrics.Historian, tracer tracing.Tracer, ruleStore RuleStore, ac AccessControl) *RemoteLokiBackend {
 	return &RemoteLokiBackend{
 		client:         lokiclient.NewLokiClient(cfg, req, metrics.BytesWritten, metrics.WriteDuration, logger, tracer, LokiClientSpanName),
 		externalLabels: cfg.ExternalLabels,
@@ -174,11 +175,11 @@ func (h *RemoteLokiBackend) Query(ctx context.Context, query models.HistoryQuery
 		}
 		res = append(res, r.Data.Result...)
 	}
-	return merge(res, uids)
+	return h.merge(res, uids)
 }
 
 // merge will put all the results in one array sorted by timestamp.
-func merge(res []lokiclient.Stream, folderUIDToFilter []string) (*data.Frame, error) {
+func (h RemoteLokiBackend) merge(res []lokiclient.Stream, folderUIDToFilter []string) (*data.Frame, error) {
 	filterByFolderUIDMap := make(map[string]struct{}, len(folderUIDToFilter))
 	for _, uid := range folderUIDToFilter {
 		filterByFolderUIDMap[uid] = struct{}{}
@@ -240,27 +241,27 @@ func merge(res []lokiclient.Stream, folderUIDToFilter []string) (*data.Frame, er
 		if minElStreamIdx == -1 {
 			break
 		}
+		entryBytes := []byte(minEl.V)
 		var entry LokiEntry
-		err := json.Unmarshal([]byte(minEl.V), &entry)
+		err := json.Unmarshal(entryBytes, &entry)
 		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal entry: %w", err)
+			h.log.Warn("failed to unmarshal entry, continuing", "err", err, "entry", minEl.V)
+			pointers[minElStreamIdx]++
+			continue
 		}
 		// Append the minimum element to the merged slice and move the pointer.
 		tsNano := minEl.T.UnixNano()
-		// TODO: In general, perhaps we should omit the offending line and log, rather than failing the request entirely.
 		streamLbls := res[minElStreamIdx].Stream
 		lblsJson, err := json.Marshal(streamLbls)
 		if err != nil {
-			return nil, fmt.Errorf("failed to serialize stream labels: %w", err)
+			// This should in theory never happen, as we're marshalling a map[string]string.
+			h.log.Warn("failed to serialize stream labels, continuing", "err", err, "labels", streamLbls)
+			pointers[minElStreamIdx]++
+			continue
 		}
-		line, err := jsonifyRow(minEl.V)
-		if err != nil {
-			return nil, fmt.Errorf("a line was in an invalid format: %w", err)
-		}
-
 		times = append(times, time.Unix(0, tsNano))
 		labels = append(labels, lblsJson)
-		lines = append(lines, line)
+		lines = append(lines, json.RawMessage(entryBytes))
 		pointers[minElStreamIdx]++
 	}
 
@@ -356,17 +357,6 @@ func valuesAsDataBlob(state *state.State) *simplejson.Json {
 	}
 
 	return jsonifyValues(state.Values)
-}
-
-func jsonifyRow(line string) (json.RawMessage, error) {
-	// Ser/deser to validate the contents of the log line before shipping it forward.
-	// TODO: We may want to remove this in the future, as we already have the value in the form of a []byte, and json.RawMessage is also a []byte.
-	// TODO: Though, if the log line does not contain valid JSON, this can cause problems later on when rendering the dataframe.
-	var entry LokiEntry
-	if err := json.Unmarshal([]byte(line), &entry); err != nil {
-		return nil, err
-	}
-	return json.Marshal(entry)
 }
 
 // BuildLogQuery converts models.HistoryQuery and a list of folder UIDs to Loki queries.
@@ -515,32 +505,27 @@ func (h *RemoteLokiBackend) getFolderUIDsForFilter(ctx context.Context, query mo
 	if err != nil {
 		return nil, err
 	}
-	if bypass { // if user has access to all rules and folder, remove filter
+
+	if query.RuleUID != "" {
+		return h.getFolderUIDsForRuleFilter(ctx, query, bypass)
+	}
+
+	// If the query has no rule filter, we need to return all folder UIDs the user has access to.
+	// For a user with access to all rules and folders, the full list of folders will likely be too large to be an
+	// effective optimization in Loki, so we skip folderUID filtering entirely in that case.
+	if bypass {
 		return nil, nil
 	}
-	// if there is a filter by rule UID, find that rule UID and make sure that user has access to it.
-	if query.RuleUID != "" {
-		rule, err := h.ruleStore.GetAlertRuleByUID(ctx, &models.GetAlertRuleByUIDQuery{
-			UID:   query.RuleUID,
-			OrgID: query.OrgID,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch alert rule by UID: %w", err)
-		}
-		if rule == nil {
-			return nil, models.ErrAlertRuleNotFound
-		}
-		return nil, h.ac.AuthorizeAccessInFolder(ctx, query.SignedInUser, rule)
-	}
-	// if no filter, then we need to get all namespaces user has access to
+
+	// All folders the user has access to.
 	folders, err := h.ruleStore.GetUserVisibleNamespaces(ctx, query.OrgID, query.SignedInUser)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch folders that user can access: %w", err)
 	}
 	uids := make([]string, 0, len(folders))
-	// now keep only UIDs of folder in which user can read rules.
+	// Keep only UIDs of folder in which user can read rules.
 	for _, f := range folders {
-		hasAccess, err := h.ac.HasAccessInFolder(ctx, query.SignedInUser, models.Namespace(*f.ToFolderReference()))
+		hasAccess, err := h.ac.HasAccessInFolder(ctx, query.SignedInUser, models.NewNamespace(f))
 		if err != nil {
 			return nil, err
 		}
@@ -554,4 +539,72 @@ func (h *RemoteLokiBackend) getFolderUIDsForFilter(ctx context.Context, query mo
 	}
 	sort.Strings(uids)
 	return uids, nil
+}
+
+func (h *RemoteLokiBackend) getFolderUIDsForRuleFilter(ctx context.Context, query models.HistoryQuery, canReadAll bool) ([]string, error) {
+	rule, err := h.ruleStore.GetAlertRuleByUID(ctx, &models.GetAlertRuleByUIDQuery{
+		UID:   query.RuleUID,
+		OrgID: query.OrgID,
+	})
+	if err != nil {
+		if canReadAll {
+			// When the user can read all rules, filtering by folder UID is purely an optimization, so we can ignore errors here.
+			h.log.FromContext(ctx).Debug("failed to fetch alert rule by UID", "err", err)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to fetch alert rule by UID: %w", err)
+	}
+
+	// First, we check if the user has access to the current version of the rule. If not, we can return early.
+	// Whether we should check historical folders they might still have access to is not 100% clear, but it seems more
+	// intuitive to deny access in this case.
+	if !canReadAll {
+		if err := h.ac.AuthorizeAccessInFolder(ctx, query.SignedInUser, rule); err != nil {
+			return nil, err
+		}
+	}
+
+	// We want to return folder UIDs when possible, as it's indexed in Loki and will help with query performance.
+	// However, by just returning the current folder UID the user can lose history when a rule is moved between folders.
+	// So, we attempt to get historical folder UIDs from the rule's history.
+	historicalFolders, err := h.ruleStore.GetAlertRuleVersionFolders(ctx, rule.OrgID, rule.GUID)
+	if err != nil {
+		// Including historical folders is an edge case enhancement, better to just log the error and continue
+		// with the current folder UID.
+		h.log.FromContext(ctx).Debug("failed to include historical folder UIDs for rule", "err", err)
+	}
+
+	accessibleFolders := make([]string, 0, len(historicalFolders)+1)
+	dedup := make(map[string]struct{})
+
+	accessibleFolders = append(accessibleFolders, rule.GetNamespaceUID())
+	dedup[rule.GetNamespaceUID()] = struct{}{}
+
+	for _, folderUID := range historicalFolders {
+		if _, exists := dedup[folderUID]; exists {
+			continue
+		}
+
+		if canReadAll {
+			// If the user can read all rules, no need to check access to each folder.
+			accessibleFolders = append(accessibleFolders, folderUID)
+			continue
+		}
+
+		hasAccess, err := h.ac.HasAccessInFolder(ctx, query.SignedInUser, models.Namespace{
+			UID: folderUID,
+		})
+		if err != nil {
+			// Including historical folders is an edge case enhancement, better to just log the error and continue
+			// with the current folder UID.
+			h.log.FromContext(ctx).Debug("failed to check access to folder", "err", err, "folderUID", folderUID)
+			continue
+		}
+		if !hasAccess {
+			continue
+		}
+		accessibleFolders = append(accessibleFolders, folderUID)
+	}
+
+	return accessibleFolders, nil
 }

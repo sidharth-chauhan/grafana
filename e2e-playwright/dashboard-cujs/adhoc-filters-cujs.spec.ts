@@ -13,7 +13,7 @@ import {
 } from './cuj-selectors';
 import { prepareAPIMocks } from './utils';
 
-export const DASHBOARD_UNDER_TEST = 'cuj-dashboard-1';
+const DASHBOARD_UNDER_TEST = 'cuj-dashboard-1';
 
 test.use({
   featureToggles: {
@@ -169,7 +169,7 @@ test.describe(
 
         await setScopes(page);
 
-        await expect(scopesSelectorInput).toHaveValue(/.+/);
+        await expect(scopesSelectorInput).toHaveAttribute('data-value', /.+/);
 
         expect(await adHocFilterPills.count()).toBe(3);
 

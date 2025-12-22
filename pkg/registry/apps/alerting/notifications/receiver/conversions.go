@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"maps"
 
+	alertingNotify "github.com/grafana/alerting/notify"
+	"github.com/grafana/alerting/receivers/schema"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
 
-	model "github.com/grafana/grafana/apps/alerting/notifications/pkg/apis/alerting/v0alpha1"
+	model "github.com/grafana/grafana/apps/alerting/notifications/pkg/apis/alertingnotifications/v0alpha1"
 	"github.com/grafana/grafana/pkg/services/apiserver/endpoints/request"
 	gapiutil "github.com/grafana/grafana/pkg/services/apiserver/utils"
 	ngmodels "github.com/grafana/grafana/pkg/services/ngalert/models"
@@ -64,11 +66,11 @@ func convertToK8sResource(
 	for _, integration := range receiver.Integrations {
 		spec.Integrations = append(spec.Integrations, model.ReceiverIntegration{
 			Uid:                   &integration.UID,
-			Type:                  integration.Config.Type,
+			Type:                  string(integration.Config.Type()),
+			Version:               string(integration.Config.Version),
 			DisableResolveMessage: &integration.DisableResolveMessage,
 			Settings:              maps.Clone(integration.Settings),
 			SecureFields:          integration.SecureFields(),
-			Version:               integration.Config.Version,
 		})
 	}
 
@@ -101,16 +103,18 @@ func convertToK8sResource(
 			rules = append(rules, rule.UID)
 		}
 		r.SetInUse(metadata.InUseByRoutes, rules)
+		r.SetCanUse(metadata.CanUse)
 	}
 	r.UID = gapiutil.CalculateClusterWideUID(r)
 	return r, nil
 }
 
 var permissionMapper = map[ngmodels.ReceiverPermission]string{
-	ngmodels.ReceiverPermissionReadSecret: "canReadSecrets",
-	ngmodels.ReceiverPermissionAdmin:      "canAdmin",
-	ngmodels.ReceiverPermissionWrite:      "canWrite",
-	ngmodels.ReceiverPermissionDelete:     "canDelete",
+	ngmodels.ReceiverPermissionReadSecret:      "canReadSecrets",
+	ngmodels.ReceiverPermissionAdmin:           "canAdmin",
+	ngmodels.ReceiverPermissionWrite:           "canWrite",
+	ngmodels.ReceiverPermissionDelete:          "canDelete",
+	ngmodels.ReceiverPermissionModifyProtected: "canModifyProtected",
 }
 
 func convertToDomainModel(receiver *model.Receiver) (*ngmodels.Receiver, map[string][]string, error) {
@@ -120,16 +124,24 @@ func convertToDomainModel(receiver *model.Receiver) (*ngmodels.Receiver, map[str
 		Integrations: make([]*ngmodels.Integration, 0, len(receiver.Spec.Integrations)),
 		Version:      receiver.ResourceVersion,
 		Provenance:   ngmodels.ProvenanceNone,
+		Origin:       ngmodels.ResourceOriginGrafana, // Set to Grafana by default.
 	}
 	storedSecureFields := make(map[string][]string, len(receiver.Spec.Integrations))
 	for _, integration := range receiver.Spec.Integrations {
-		version := &integration.Version
-		if *version == "" {
-			version = nil
-		}
-		config, err := ngmodels.IntegrationConfigFromType(integration.Type, version)
+		t, err := alertingNotify.IntegrationTypeFromString(integration.Type)
 		if err != nil {
 			return nil, nil, err
+		}
+		var config schema.IntegrationSchemaVersion
+		typeSchema, _ := alertingNotify.GetSchemaForIntegration(t)
+		if integration.Version != "" {
+			var ok bool
+			config, ok = typeSchema.GetVersion(schema.Version(integration.Version))
+			if !ok {
+				return nil, nil, fmt.Errorf("invalid version %s for integration type %s", integration.Version, integration.Type)
+			}
+		} else {
+			config = typeSchema.GetCurrentVersion()
 		}
 		grafanaIntegration := ngmodels.Integration{
 			Name:           receiver.Spec.Title,

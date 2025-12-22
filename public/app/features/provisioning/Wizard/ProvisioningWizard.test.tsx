@@ -1,12 +1,14 @@
 import { QueryStatus } from '@reduxjs/toolkit/query';
 import { screen, waitFor } from '@testing-library/react';
 import { UserEvent } from '@testing-library/user-event';
+import type { JSX } from 'react';
 import { render } from 'test/test-utils';
 
 import {
   useCreateRepositoryJobsMutation,
   useGetFrontendSettingsQuery,
   useGetRepositoryFilesQuery,
+  useGetRepositoryStatusQuery,
   useGetResourceStatsQuery,
 } from 'app/api/clients/provisioning/v0alpha1';
 
@@ -29,6 +31,7 @@ jest.mock('app/api/clients/provisioning/v0alpha1', () => ({
   ...jest.requireActual('app/api/clients/provisioning/v0alpha1'),
   useGetFrontendSettingsQuery: jest.fn(),
   useGetRepositoryFilesQuery: jest.fn(),
+  useGetRepositoryStatusQuery: jest.fn(),
   useGetResourceStatsQuery: jest.fn(),
   useCreateRepositoryJobsMutation: jest.fn(),
 }));
@@ -42,6 +45,9 @@ const mockUseGetFrontendSettingsQuery = useGetFrontendSettingsQuery as jest.Mock
 >;
 const mockUseGetRepositoryFilesQuery = useGetRepositoryFilesQuery as jest.MockedFunction<
   typeof useGetRepositoryFilesQuery
+>;
+const mockUseGetRepositoryStatusQuery = useGetRepositoryStatusQuery as jest.MockedFunction<
+  typeof useGetRepositoryStatusQuery
 >;
 const mockUseGetResourceStatsQuery = useGetResourceStatsQuery as jest.MockedFunction<typeof useGetResourceStatsQuery>;
 const mockUseCreateRepositoryJobsMutation = useCreateRepositoryJobsMutation as jest.MockedFunction<
@@ -115,7 +121,7 @@ describe('ProvisioningWizard', () => {
     mockUseGetFrontendSettingsQuery.mockReturnValue({
       data: {
         items: [],
-        legacyStorage: false,
+        allowImageRendering: true,
         availableRepositoryTypes: ['github', 'gitlab', 'bitbucket', 'git', 'local'],
       },
       isLoading: false,
@@ -126,6 +132,23 @@ describe('ProvisioningWizard', () => {
     mockUseGetRepositoryFilesQuery.mockReturnValue({
       data: [],
       isLoading: false,
+      error: null,
+      refetch: jest.fn(),
+    });
+
+    mockUseGetRepositoryStatusQuery.mockReturnValue({
+      data: {
+        status: {
+          health: {
+            healthy: true,
+            checked: true,
+            message: '',
+          },
+        },
+      },
+      isLoading: false,
+      isFetching: false,
+      isError: false,
       error: null,
       refetch: jest.fn(),
     });
@@ -199,6 +222,15 @@ describe('ProvisioningWizard', () => {
       mockUseGetResourceStatsQuery.mockReturnValue({
         data: {
           instance: [{ group: 'dashboard.grafana.app', count: 1 }],
+        },
+        isLoading: false,
+        error: null,
+        refetch: jest.fn(),
+      });
+      // Mock files to ensure sync step is not skipped for folder sync
+      mockUseGetRepositoryFilesQuery.mockReturnValue({
+        data: {
+          items: [{ name: 'test.json', path: 'test.json' }],
         },
         isLoading: false,
         error: null,
@@ -477,10 +509,10 @@ describe('ProvisioningWizard', () => {
     });
 
     it('should show button text changes based on current step', async () => {
-      // Mock resources to ensure sync step is not skipped
-      mockUseGetResourceStatsQuery.mockReturnValue({
+      // Mock files to ensure sync step is not skipped for folder sync
+      mockUseGetRepositoryFilesQuery.mockReturnValue({
         data: {
-          instance: [{ group: 'dashboard.grafana.app', count: 1 }],
+          items: [{ name: 'test.json', path: 'test.json' }],
         },
         isLoading: false,
         error: null,

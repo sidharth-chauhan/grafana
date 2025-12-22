@@ -3,12 +3,14 @@ package provisioning
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	provisioningAPIServer "github.com/grafana/grafana/pkg/registry/apis/provisioning"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -18,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
+	"github.com/grafana/grafana/apps/provisioning/pkg/repository"
 	"github.com/grafana/grafana/pkg/apimachinery/utils"
 	"github.com/grafana/grafana/pkg/infra/usagestats"
 	"github.com/grafana/grafana/pkg/tests/apis"
@@ -133,6 +136,19 @@ func TestIntegrationProvisioning_CreatingAndGetting(t *testing.T) {
 				return
 			}
 
+			for _, i := range settings.Items {
+				switch i.Type {
+				case provisioning.LocalRepositoryType:
+					assert.Equal(collect, i.Path, helper.ProvisioningPath)
+				case provisioning.GitHubRepositoryType:
+					assert.Equal(collect, i.URL, "https://github.com/grafana/grafana-git-sync-demo")
+					assert.Equal(collect, i.Path, "grafana/")
+				default:
+					assert.NotEmpty(collect, i.Path)
+					assert.NotEmpty(collect, i.URL)
+				}
+			}
+
 			assert.ElementsMatch(collect, []provisioning.RepositoryType{
 				provisioning.LocalRepositoryType,
 				provisioning.GitHubRepositoryType,
@@ -159,6 +175,122 @@ func TestIntegrationProvisioning_CreatingAndGetting(t *testing.T) {
 				"stats.repository.local.count":  1.0,
 			}, stats)
 		}, time.Second*10, time.Millisecond*100, "Expected stats to match")
+	})
+}
+
+func TestIntegrationProvisioning_RepositoryValidation(t *testing.T) {
+	testutil.SkipIntegrationTestInShortMode(t)
+
+	helper := runGrafana(t)
+	ctx := context.Background()
+
+	for _, testCase := range []struct {
+		name        string
+		repo        *unstructured.Unstructured
+		expectedErr string
+	}{
+		{
+			name: "should succeed with valid local repository",
+			repo: func() *unstructured.Unstructured {
+				return helper.RenderObject(t, "testdata/local-readonly.json.tmpl", map[string]any{
+					"Name":        "valid-repo",
+					"SyncEnabled": true,
+				})
+			}(),
+		},
+		{
+			name: "should error if mutually exclusive finalizers are set",
+			repo: func() *unstructured.Unstructured {
+				localTmp := helper.RenderObject(t, "testdata/local-readonly.json.tmpl", map[string]any{
+					"Name":        "repo-with-invalid-finalizers",
+					"SyncEnabled": true,
+				})
+
+				// Setting finalizers to trigger a failure
+				localTmp.SetFinalizers([]string{
+					repository.CleanFinalizer,
+					repository.ReleaseOrphanResourcesFinalizer,
+					repository.RemoveOrphanResourcesFinalizer,
+				})
+
+				return localTmp
+			}(),
+			expectedErr: "cannot have both remove and release orphan resources finalizers",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := helper.Repositories.Resource.Create(ctx, testCase.repo, metav1.CreateOptions{})
+			if testCase.expectedErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.Error(t, err)
+				assert.ErrorContains(t, err, testCase.expectedErr)
+			}
+		})
+	}
+
+	// Test Git repository path validation - ensure child paths are rejected
+	t.Run("Git repository path validation", func(t *testing.T) {
+		baseURL := "https://github.com/grafana/test-repo-path-validation"
+
+		pathTests := []struct {
+			name        string
+			path        string
+			expectError error
+		}{
+			{
+				name:        "first repo with path 'demo/nested' should succeed",
+				path:        "demo/nested",
+				expectError: nil,
+			},
+			{
+				name:        "second repo with child path 'demo/nested/again' should fail",
+				path:        "demo/nested/again",
+				expectError: provisioningAPIServer.ErrRepositoryParentFolderConflict,
+			},
+			{
+				name:        "third repo with parent path 'demo' should fail",
+				path:        "demo",
+				expectError: provisioningAPIServer.ErrRepositoryParentFolderConflict,
+			},
+			{
+				name:        "fourth repo with nested child path 'demo/nested/nested-second' should fail",
+				path:        "demo/nested/again/two",
+				expectError: provisioningAPIServer.ErrRepositoryParentFolderConflict,
+			},
+			{
+				name:        "fifth repo with duplicate path 'demo/nested' should fail",
+				path:        "demo/nested",
+				expectError: provisioningAPIServer.ErrRepositoryDuplicatePath,
+			},
+		}
+
+		for i, test := range pathTests {
+			t.Run(test.name, func(t *testing.T) {
+				repoName := fmt.Sprintf("git-path-test-%d", i+1)
+				gitRepo := helper.RenderObject(t, "testdata/github-readonly.json.tmpl", map[string]any{
+					"Name":        repoName,
+					"URL":         baseURL,
+					"Path":        test.path,
+					"SyncEnabled": false, // Disable sync to avoid external dependencies
+					"SyncTarget":  "folder",
+				})
+
+				_, err := helper.Repositories.Resource.Create(ctx, gitRepo, metav1.CreateOptions{FieldValidation: "Strict"})
+
+				if test.expectError != nil {
+					require.Error(t, err, "Expected error for repository with path: %s", test.path)
+					require.ErrorContains(t, err, test.expectError.Error(), "Error should contain expected message for path: %s", test.path)
+					var statusError *apierrors.StatusError
+					if errors.As(err, &statusError) {
+						require.Equal(t, metav1.StatusReasonInvalid, statusError.ErrStatus.Reason, "Should be a validation error")
+						require.Equal(t, http.StatusUnprocessableEntity, int(statusError.ErrStatus.Code), "Should return 422 status code")
+					}
+				} else {
+					require.NoError(t, err, "Expected success for repository with path: %s", test.path)
+				}
+			})
+		}
 	})
 }
 
@@ -311,7 +443,8 @@ func TestIntegrationProvisioning_CreatingGitHubRepository(t *testing.T) {
 					"Name":        test.name,
 					"URL":         test.input,
 					"SyncTarget":  "folder",
-					"SyncEnabled": false, // Disable sync since we're just testing URL cleanup
+					"SyncEnabled": false, // Disable sync since we're just testing URL cleanup,
+					"Path":        fmt.Sprintf("grafana-%s/", test.name),
 				})
 
 				_, err := helper.Repositories.Resource.Create(ctx, input, metav1.CreateOptions{})
@@ -445,7 +578,13 @@ func TestIntegrationProvisioning_RunLocalRepository(t *testing.T) {
 	const targetPath = "all-panels.json"
 
 	// Set up the repository.
-	helper.CreateRepo(t, TestRepo{Name: repo})
+	helper.CreateRepo(t, TestRepo{
+		Name:                   repo,
+		Target:                 "folder",
+		ExpectedDashboards:     0,
+		ExpectedFolders:        1, // folder sync creates a folder for the repo
+		SkipResourceAssertions: false,
+	})
 
 	// Write a file -- this will create it *both* in the local file system, and in grafana
 	t.Run("write all panels", func(t *testing.T) {
@@ -611,10 +750,10 @@ func TestIntegrationProvisioning_ImportAllPanelsFromLocalRepository(t *testing.T
 	// Set up the repository and the file to import.
 	testRepo := TestRepo{
 		Name:               repo,
-		Target:             "instance",
+		Target:             "folder",
 		Copies:             map[string]string{"testdata/all-panels.json": "all-panels.json"},
 		ExpectedDashboards: 1,
-		ExpectedFolders:    0,
+		ExpectedFolders:    1, // folder sync creates a folder
 	}
 	// We create the repository
 	helper.CreateRepo(t, testRepo)
@@ -653,7 +792,7 @@ func TestIntegrationProvisioning_ImportAllPanelsFromLocalRepository(t *testing.T
 	v, _, _ := unstructured.NestedString(obj.Object, "metadata", "annotations", utils.AnnoKeyUpdatedBy)
 	require.Equal(t, "access-policy:provisioning", v)
 
-	// Should not be able to directly delete the managed resource
+	// Should be able to directly delete the managed resource
 	err = helper.DashboardsV1.Resource.Delete(ctx, allPanels, metav1.DeleteOptions{})
 	require.NoError(t, err, "user can delete")
 
@@ -733,4 +872,150 @@ func TestIntegrationProvisioning_DeleteRepositoryAndReleaseResources(t *testing.
 			assert.NotContains(t, v.GetAnnotations(), utils.AnnoKeySourceChecksum)
 		}
 	}, time.Second*20, time.Millisecond*10, "Expected folders to be released")
+}
+
+func TestIntegrationProvisioning_JobPermissions(t *testing.T) {
+	testutil.SkipIntegrationTestInShortMode(t)
+
+	helper := runGrafana(t)
+	ctx := context.Background()
+
+	const repo = "job-permissions-test"
+	testRepo := TestRepo{
+		Name:               repo,
+		Target:             "folder",
+		Copies:             map[string]string{}, // No files needed for this test
+		ExpectedDashboards: 0,
+		ExpectedFolders:    1, // Repository creates a folder
+	}
+	helper.CreateRepo(t, testRepo)
+
+	jobSpec := provisioning.JobSpec{
+		Action: provisioning.JobActionPull,
+		Pull:   &provisioning.SyncJobOptions{},
+	}
+	body := asJSON(jobSpec)
+
+	t.Run("editor can POST jobs", func(t *testing.T) {
+		var statusCode int
+		result := helper.EditorREST.Post().
+			Namespace("default").
+			Resource("repositories").
+			Name(repo).
+			SubResource("jobs").
+			Body(body).
+			SetHeader("Content-Type", "application/json").
+			Do(ctx).StatusCode(&statusCode)
+
+		require.NoError(t, result.Error(), "editor should be able to POST jobs")
+		require.Equal(t, http.StatusAccepted, statusCode, "should return 202 Accepted")
+
+		// Verify the job was created
+		obj, err := result.Get()
+		require.NoError(t, err, "should get job object")
+		unstruct, ok := obj.(*unstructured.Unstructured)
+		require.True(t, ok, "expecting unstructured object")
+		require.NotEmpty(t, unstruct.GetName(), "job should have a name")
+	})
+
+	t.Run("viewer cannot POST jobs", func(t *testing.T) {
+		var statusCode int
+		result := helper.ViewerREST.Post().
+			Namespace("default").
+			Resource("repositories").
+			Name(repo).
+			SubResource("jobs").
+			Body(body).
+			SetHeader("Content-Type", "application/json").
+			Do(ctx).StatusCode(&statusCode)
+
+		require.Error(t, result.Error(), "viewer should not be able to POST jobs")
+		require.Equal(t, http.StatusForbidden, statusCode, "should return 403 Forbidden")
+		require.True(t, apierrors.IsForbidden(result.Error()), "error should be forbidden")
+	})
+
+	t.Run("admin can POST jobs", func(t *testing.T) {
+		var statusCode int
+		result := helper.AdminREST.Post().
+			Namespace("default").
+			Resource("repositories").
+			Name(repo).
+			SubResource("jobs").
+			Body(body).
+			SetHeader("Content-Type", "application/json").
+			Do(ctx).StatusCode(&statusCode)
+
+		// Job might already exist from previous test, which is acceptable
+		if apierrors.IsAlreadyExists(result.Error()) {
+			// Wait for the existing job to complete
+			helper.AwaitJobs(t, repo)
+			return
+		}
+
+		require.NoError(t, result.Error(), "admin should be able to POST jobs")
+		require.Equal(t, http.StatusAccepted, statusCode, "should return 202 Accepted")
+	})
+}
+
+func TestIntegrationProvisioning_RefsPermissions(t *testing.T) {
+	testutil.SkipIntegrationTestInShortMode(t)
+
+	helper := runGrafana(t)
+	ctx := context.Background()
+
+	const repo = "refs-permissions-test"
+	testRepo := TestRepo{
+		Name:               repo,
+		Template:           "testdata/github-readonly.json.tmpl",
+		Target:             "folder",
+		ExpectedDashboards: 3,
+		ExpectedFolders:    3, // Repository creates folders
+	}
+	helper.CreateRepo(t, testRepo)
+
+	t.Run("editor can GET refs", func(t *testing.T) {
+		var statusCode int
+		result := helper.EditorREST.Get().
+			Namespace("default").
+			Resource("repositories").
+			Name(repo).
+			SubResource("refs").
+			Do(ctx).StatusCode(&statusCode)
+
+		require.NoError(t, result.Error(), "editor should be able to GET refs")
+		require.Equal(t, http.StatusOK, statusCode, "should return 200 OK")
+
+		// Verify we can parse the refs and it contains at least main branch
+		refs := &provisioning.RefList{}
+		err := result.Into(refs)
+		require.NoError(t, err, "should parse refs response")
+		require.NotEmpty(t, refs.Items, "should have at least one ref")
+	})
+
+	t.Run("viewer cannot GET refs", func(t *testing.T) {
+		var statusCode int
+		result := helper.ViewerREST.Get().
+			Namespace("default").
+			Resource("repositories").
+			Name(repo).
+			SubResource("refs").
+			Do(ctx).StatusCode(&statusCode)
+
+		require.Error(t, result.Error(), "viewer should not be able to GET refs")
+		require.Equal(t, http.StatusForbidden, statusCode, "should return 403 Forbidden")
+		require.True(t, apierrors.IsForbidden(result.Error()), "error should be forbidden")
+	})
+
+	t.Run("admin can GET refs", func(t *testing.T) {
+		var statusCode int
+		result := helper.AdminREST.Get().
+			Namespace("default").
+			Resource("repositories").
+			Name(repo).
+			SubResource("refs").
+			Do(ctx).StatusCode(&statusCode)
+
+		require.NoError(t, result.Error(), "admin should be able to GET refs")
+		require.Equal(t, http.StatusOK, statusCode, "should return 200 OK")
+	})
 }
